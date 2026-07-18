@@ -35,14 +35,23 @@ from dimos.web.relay_bridge.protocol import (
     Delivery,
     FrameHeader,
     Hello,
+    Msg,
     Ping,
     ProtocolError,
+    RobotInfo,
+    RobotManifest,
     Role,
+    encode_datagram,
 )
 
 logger = setup_logger()
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+# QUIC datagrams above the path MTU are dropped, not fragmented; typical
+# budget after QUIC overhead is ~1200 B. Warn while a robot hello (identity +
+# manifest) still fits comfortably rather than fail mysteriously later.
+_HELLO_DATAGRAM_WARN_BYTES = 1100
 
 
 class RelayClient:
@@ -121,16 +130,31 @@ class RelayClient:
         self._writers.clear()
         await self._ctx.__aexit__(None, None, None)
 
-    async def hello(self, timeout: float = 5.0) -> None:
+    async def hello(
+        self,
+        timeout: float = 5.0,
+        *,
+        robot: RobotInfo | None = None,
+        manifest: RobotManifest | None = None,
+    ) -> None:
         """Send hello datagrams until the relay's welcome arrives.
 
-        Datagrams are lossy, so the hello is repeated every 200 ms. Raises
-        ProtocolError if the relay answers with an error (version mismatch),
+        Robot sessions carry their identity and channel manifest in the hello
+        (the relay registers the robot from it). Datagrams are lossy, so the
+        hello is repeated every 200 ms. Raises ProtocolError if the relay
+        answers with an error (version mismatch, missing robot id),
         TimeoutError if nothing answers within `timeout`.
         """
+        msg = Hello(v=PROTOCOL_VERSION, role=self.role, robot=robot, manifest=manifest)
+        size = len(encode_datagram(msg))
+        if size > _HELLO_DATAGRAM_WARN_BYTES:
+            logger.warning(
+                f"hello datagram is {size} B; QUIC datagrams above the ~1200 B path MTU "
+                "are dropped - trim the manifest"
+            )
         deadline = time.monotonic() + timeout
         while True:
-            self._session.send_msg(Hello(v=PROTOCOL_VERSION, role=self.role))
+            self._session.send_msg(msg)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._session.welcomed.wait(), 0.2)
             if self._session.relay_error is not None:
@@ -140,6 +164,10 @@ class RelayClient:
                 return
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"no welcome from relay within {timeout} s")
+
+    def send_control(self, msg: Msg) -> None:
+        """Send one control message to the relay (datagram: lossy, ordered-less)."""
+        self._session.send_msg(msg)
 
     async def ping(self, timeout: float = 5.0) -> float:
         """Datagram ping; returns the round-trip time in seconds."""
@@ -217,10 +245,37 @@ class RelayClient:
         finally:
             closed.cancel()
 
+    async def control_messages(self) -> AsyncIterator[Msg]:
+        """Control messages pushed by the relay (subs snapshots, robots, ...).
+
+        Same contract as :meth:`frames`: buffered messages drain before the
+        close is honored, and cancelling the consumer never orphans the queue
+        getter. Ends when the session closes.
+        """
+        closed = asyncio.ensure_future(self._session.wait_closed())
+        try:
+            while True:
+                get = asyncio.ensure_future(self._session.control_msgs.get())
+                try:
+                    await asyncio.wait({get, closed}, return_when=asyncio.FIRST_COMPLETED)
+                    if not get.done():
+                        return
+                    msg = get.result()
+                finally:
+                    get.cancel()
+                yield msg
+        finally:
+            closed.cancel()
+
     @property
     def frames_dropped(self) -> int:
         """Frames dropped locally because the consumer lagged (drop-oldest)."""
         return self._session.frames_dropped
+
+    @property
+    def control_dropped(self) -> int:
+        """Control messages dropped locally under consumer lag (drop-oldest)."""
+        return self._session.control_dropped
 
 
 class LatestChannelWriter:

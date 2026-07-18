@@ -36,11 +36,28 @@ from urllib.parse import urlparse
 import cv2
 import numpy as np
 
-from dimos.web.relay_bridge.protocol import DataFrame
+from dimos.web.relay_bridge.protocol import (
+    ChannelSpec,
+    DataFrame,
+    Manifest,
+    RobotInfo,
+    RobotManifest,
+    Sub,
+    Subs,
+    Watch,
+)
 from dimos.web.relay_bridge.relay_process import RelayProcess
 from dimos.web.relay_bridge.wt_client import RelayClient
 
 WIDTH, HEIGHT = 640, 480
+
+ROBOT = RobotInfo(id="smoke", name="Smoke Demo", model="synthetic")
+MANIFEST = RobotManifest(
+    channels=[
+        ChannelSpec(ch="color_image", encoding="jpeg.v1", delivery="latest", maxHz=60.0),
+        ChannelSpec(ch="odom", encoding="pose.json.v1", delivery="reliable", maxHz=20.0),
+    ]
+)
 
 
 def make_jpeg(seq: int) -> bytes:
@@ -91,14 +108,45 @@ class ViewerStats:
         return " | ".join(parts) or "(nothing received yet)"
 
 
+async def _attach_viewer(viewer: RelayClient) -> None:
+    """watch the demo robot, then subscribe to both channels.
+
+    watch rides a lossy datagram, so it is resent until the manifest reply
+    proves it landed; subs go out only after that.
+    """
+    await viewer.hello()
+    deadline = time.monotonic() + 10
+    while True:
+        viewer.send_control(Watch(robotId=ROBOT.id))
+        with contextlib.suppress(asyncio.TimeoutError):
+            msg = await asyncio.wait_for(viewer._session.control_msgs.get(), 0.5)
+            while not isinstance(msg, Manifest):
+                msg = await asyncio.wait_for(viewer._session.control_msgs.get(), 0.5)
+            break
+        if time.monotonic() > deadline:
+            raise TimeoutError("viewer could not watch the demo robot")
+    for spec in MANIFEST.channels:
+        viewer.send_control(Sub(ch=spec.ch))
+
+
+async def _wait_subscribed(robot: RelayClient) -> None:
+    """Robot-side barrier: block until the relay reports both channels wanted."""
+    wanted = {spec.ch for spec in MANIFEST.channels}
+    async for msg in robot.control_messages():
+        if isinstance(msg, Subs) and wanted <= set(msg.chs):
+            return
+    raise RuntimeError("relay session closed before viewers subscribed")
+
+
 async def run(url: str, secs: float) -> None:
     stats = ViewerStats()
     async with (
         await RelayClient.connect(url, "robot") as robot,
         await RelayClient.connect(url, "viewer") as viewer,
     ):
-        await robot.hello()
-        await viewer.hello()
+        await robot.hello(robot=ROBOT, manifest=MANIFEST)
+        await _attach_viewer(viewer)
+        await asyncio.wait_for(_wait_subscribed(robot), timeout=10)
         rtt = await viewer.ping()
         print(f"connected; datagram RTT {rtt * 1000:.1f} ms")
 

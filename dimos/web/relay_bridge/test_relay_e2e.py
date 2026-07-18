@@ -19,7 +19,7 @@ single xdist worker.
 """
 
 import asyncio
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 import hashlib
 import json
 import statistics
@@ -28,9 +28,25 @@ import urllib.request
 
 import pytest
 
-from dimos.web.relay_bridge.protocol import DataFrame, FrameHeader
+from dimos.web.relay_bridge.protocol import (
+    DataFrame,
+    FrameHeader,
+    Manifest,
+    Msg,
+    RobotInfo,
+    Sub,
+    Subs,
+    Unsub,
+    Watch,
+)
 from dimos.web.relay_bridge.relay_process import RelayProcess, RelayReadyInfo
 from dimos.web.relay_bridge.wt_client import RelayClient
+
+# One robot identity for the whole module: back-to-back tests reattach via
+# the relay's duplicate-id takeover, exactly like a restarted dimos process.
+# No manifest on purpose: undeclared channels take the frame header's
+# delivery, which is what these transport tests steer with.
+ROBOT = RobotInfo(id="e2e-bot", name="E2E Bot", model="test")
 
 
 @pytest.fixture(scope="module")
@@ -40,6 +56,63 @@ def relay() -> Iterator[RelayReadyInfo]:
         yield process.start()
     finally:
         process.stop()
+
+
+async def _next_control(client: RelayClient, timeout: float) -> Msg | None:
+    try:
+        return await asyncio.wait_for(client._session.control_msgs.get(), timeout)
+    except asyncio.TimeoutError:
+        return None
+
+
+async def attach_viewer(
+    viewer: RelayClient, robot_id: str, chs: Sequence[str], timeout: float = 10.0
+) -> None:
+    """hello -> watch -> sub each channel.
+
+    watch rides a lossy datagram on the Python leg, so it is resent until the
+    manifest reply proves it landed; subs go out only after that (a reordered
+    sub-before-watch would bounce with no_watch).
+    """
+    await viewer.hello()
+    deadline = time.monotonic() + timeout
+    while True:
+        viewer.send_control(Watch(robotId=robot_id))
+        msg = await _next_control(viewer, 0.5)
+        while msg is not None and not isinstance(msg, Manifest):
+            msg = await _next_control(viewer, 0.5)
+        if isinstance(msg, Manifest):
+            break
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"no manifest for {robot_id} within {timeout} s")
+    for ch in chs:
+        viewer.send_control(Sub(ch=ch))
+
+
+async def wait_subs(
+    robot: RelayClient, chs: set[str], timeout: float = 10.0, *, exact: bool = False
+) -> None:
+    """Block until a subs snapshot covering `chs` (or exactly `chs`) arrives.
+
+    The barrier every data test needs: frames sent before the relay processed
+    the viewer's subs are (correctly) not forwarded. `exact` waits for the set
+    to shrink to precisely `chs` (unsub barriers).
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        msg = await _next_control(robot, deadline - time.monotonic())
+        if not isinstance(msg, Subs):
+            continue
+        if set(msg.chs) == chs if exact else set(msg.chs) >= chs:
+            return
+    raise TimeoutError(f"no subs snapshot covering {chs} within {timeout} s")
+
+
+async def attach(robot: RelayClient, viewer: RelayClient, chs: Sequence[str]) -> None:
+    """Standard session preamble: robot hello, viewer watch+sub, subs barrier."""
+    await robot.hello(robot=ROBOT)
+    await attach_viewer(viewer, ROBOT.id, chs)
+    await wait_subs(robot, set(chs))
 
 
 async def collect_until(
@@ -80,9 +153,15 @@ def test_info_matches_ready_line(relay: RelayReadyInfo) -> None:
 
 async def test_robot_handshake_and_datagram_rtt(relay: RelayReadyInfo) -> None:
     async with await RelayClient.connect(relay.wt_url, "robot") as robot:
-        await robot.hello()
+        await robot.hello(robot=ROBOT)
         rtts = [await robot.ping() for _ in range(20)]
     assert statistics.median(rtts) < 0.1
+
+
+async def test_robot_hello_without_identity_is_rejected(relay: RelayReadyInfo) -> None:
+    async with await RelayClient.connect(relay.wt_url, "robot") as robot:
+        with pytest.raises(Exception, match="missing_robot_id"):
+            await robot.hello()
 
 
 async def test_reliable_channel_is_complete_and_intact(relay: RelayReadyInfo) -> None:
@@ -90,8 +169,7 @@ async def test_reliable_channel_is_complete_and_intact(relay: RelayReadyInfo) ->
         await RelayClient.connect(relay.wt_url, "robot") as robot,
         await RelayClient.connect(relay.wt_url, "viewer") as viewer,
     ):
-        await robot.hello()
-        await viewer.hello()
+        await attach(robot, viewer, ["odom"])
         count = 100
         payloads = [seq.to_bytes(4, "little") * 256 for seq in range(count)]
         for seq, payload in enumerate(payloads):
@@ -115,8 +193,7 @@ async def test_latest_channel_newest_wins(relay: RelayReadyInfo) -> None:
         await RelayClient.connect(relay.wt_url, "robot") as robot,
         await RelayClient.connect(relay.wt_url, "viewer") as viewer,
     ):
-        await robot.hello()
-        await viewer.hello()
+        await attach(robot, viewer, ["cam"])
         writer = robot.latest_writer("cam")
         offered = 200
         for i in range(offered):
@@ -151,8 +228,7 @@ async def test_large_frame_1mib(relay: RelayReadyInfo) -> None:
         await RelayClient.connect(relay.wt_url, "robot") as robot,
         await RelayClient.connect(relay.wt_url, "viewer") as viewer,
     ):
-        await robot.hello()
-        await viewer.hello()
+        await attach(robot, viewer, ["blob"])
         payload = bytes(range(256)) * 4096  # 1 MiB
         robot.send_frame("blob", payload, delivery="reliable")
         frames = await collect_until(viewer, lambda fs: any(f.header.ch == "blob" for f in fs))
@@ -167,8 +243,7 @@ async def test_reset_stale_discards_partial_frame(relay: RelayReadyInfo) -> None
         await RelayClient.connect(relay.wt_url, "robot") as robot,
         await RelayClient.connect(relay.wt_url, "viewer") as viewer,
     ):
-        await robot.hello()
-        await viewer.hello()
+        await attach(robot, viewer, ["cam"])
         # 8 MiB cannot be flushed + ACKed within the same event-loop turn, so
         # the reset below reliably lands mid-transfer.
         big = robot.send_frame("cam", b"\xcd" * (8 * 1024 * 1024), delivery="latest")
@@ -196,8 +271,7 @@ async def test_reset_burst_does_not_wedge_robot_leg(relay: RelayReadyInfo) -> No
         await RelayClient.connect(relay.wt_url, "robot") as robot,
         await RelayClient.connect(relay.wt_url, "viewer") as viewer,
     ):
-        await robot.hello()
-        await viewer.hello()
+        await attach(robot, viewer, ["cam"])
         for rnd in range(5):
             # The accept glue cannot have read all 50 preambles before the
             # resets land, so some streams are reset pre-acceptance.
@@ -224,21 +298,58 @@ async def test_stats_reflect_traffic(relay: RelayReadyInfo) -> None:
         await RelayClient.connect(relay.wt_url, "robot") as robot,
         await RelayClient.connect(relay.wt_url, "viewer") as viewer,
     ):
-        await robot.hello()
-        await viewer.hello()
+        await attach(robot, viewer, ["odom"])
         robot.send_frame("odom", b"{}", delivery="reliable")
         await collect_until(viewer, lambda fs: len(fs) >= 1, timeout=5.0)
 
         stats = await fetch_stats(relay)
-        assert stats["robot"] is True
+        assert {"id": ROBOT.id, "name": ROBOT.name, "model": ROBOT.model} in stats["robots"]
         assert stats["viewers"] >= 1
-        assert stats["channels"]["odom"]["framesIn"] >= 1
-        assert stats["channels"]["odom"]["delivery"] == "reliable"
+        assert stats["perRobot"][ROBOT.id]["subs"] == ["odom"]
+        assert stats["perRobot"][ROBOT.id]["channels"]["odom"]["framesIn"] >= 1
+        assert stats["perRobot"][ROBOT.id]["channels"]["odom"]["delivery"] == "reliable"
+
+
+async def test_duplicate_robot_id_takeover(relay: RelayReadyInfo) -> None:
+    """A restarted robot process reattaches: the relay closes the old session."""
+    async with await RelayClient.connect(relay.wt_url, "robot") as first:
+        await first.hello(robot=ROBOT)
+        async with (
+            await RelayClient.connect(relay.wt_url, "robot") as second,
+            await RelayClient.connect(relay.wt_url, "viewer") as viewer,
+        ):
+            await second.hello(robot=ROBOT)
+            # The relay closes the replaced session, visible client-side.
+            await asyncio.wait_for(first.wait_closed(), timeout=10.0)
+            await attach_viewer(viewer, ROBOT.id, ["odom"])
+            await wait_subs(second, {"odom"})
+            second.send_frame("odom", b"from-second", delivery="reliable")
+            frames = await collect_until(viewer, lambda fs: any(f.header.ch == "odom" for f in fs))
+            assert [bytes(f.payload) for f in frames if f.header.ch == "odom"] == [b"from-second"]
+
+
+async def test_unsub_stops_forwarding_and_bridge_hears_it(relay: RelayReadyInfo) -> None:
+    """Unsub drops the viewer's channel and the robot gets the shrunk snapshot."""
+    async with (
+        await RelayClient.connect(relay.wt_url, "robot") as robot,
+        await RelayClient.connect(relay.wt_url, "viewer") as viewer,
+    ):
+        await attach(robot, viewer, ["cam", "odom"])
+        viewer.send_control(Unsub(ch="cam"))
+        # The snapshot shrinking to odom-only is both the assertion that the
+        # bridge hears the transition and the barrier that unsub was processed.
+        await wait_subs(robot, {"odom"}, exact=True)
+
+        robot.send_frame("cam", b"not-forwarded", delivery="latest")
+        robot.send_frame("odom", b"forwarded", delivery="reliable")
+        frames = await collect_until(viewer, lambda fs: any(f.header.ch == "odom" for f in fs))
+        assert [bytes(f.payload) for f in frames if f.header.ch == "odom"] == [b"forwarded"]
+        assert [f for f in frames if f.header.ch == "cam"] == []
 
 
 async def test_send_frame_paces_with_wait_delivered(relay: RelayReadyInfo) -> None:
     async with await RelayClient.connect(relay.wt_url, "robot") as robot:
-        await robot.hello()
+        await robot.hello(robot=ROBOT)
         start = time.monotonic()
         stream_id = robot.send_frame("odom", b"x" * 1000, delivery="reliable")
         assert await robot.wait_delivered(stream_id, timeout=5.0)
@@ -251,8 +362,7 @@ async def test_malformed_robot_frame_is_dropped(relay: RelayReadyInfo) -> None:
         await RelayClient.connect(relay.wt_url, "robot") as robot,
         await RelayClient.connect(relay.wt_url, "viewer") as viewer,
     ):
-        await robot.hello()
-        await viewer.hello()
+        await attach(robot, viewer, ["cam"])
         before = (await fetch_stats(relay)).get("framesDropped", 0)
         # The client validates delivery, so model_construct skips it to put a
         # bogus value on the wire; the relay's validator must reject it.
@@ -283,8 +393,7 @@ async def test_latest_writer_resets_stale_stream(relay: RelayReadyInfo) -> None:
         await RelayClient.connect(relay.wt_url, "robot") as robot,
         await RelayClient.connect(relay.wt_url, "viewer") as viewer,
     ):
-        await robot.hello()
-        await viewer.hello()
+        await attach(robot, viewer, ["cam"])
         writer = robot.latest_writer("cam", stale_after=0.02)
         # 8 MiB can't flush + ACK within stale_after, so it stays in flight.
         writer.offer(b"\xcd" * (8 * 1024 * 1024))
@@ -315,7 +424,7 @@ async def test_close_signal_stops_writer_and_wakes_waiter() -> None:
     try:
         info = process.start()
         async with await RelayClient.connect(info.wt_url, "robot") as robot:
-            await robot.hello()
+            await robot.hello(robot=ROBOT)
             writer = robot.latest_writer("cam")
             writer.offer(b"x" * 1000)
             await asyncio.sleep(0.1)  # let the pump start
