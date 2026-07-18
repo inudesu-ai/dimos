@@ -92,6 +92,10 @@ class GlobalConfig(BaseSettings):
     dimsim_scene: str = "apartment"
     dimsim_port: int = 8090
     dimsim_headless: bool = True
+    # Cockpit relay (dimos/web/relay_bridge): --local-relay spawns a local
+    # relay + bridge; --relay-url attaches the bridge to a running relay.
+    local_relay: bool = False
+    relay_url: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",
