@@ -61,7 +61,7 @@ def vis_module(
             rerun_config.setdefault("pubsubs", [LCM()])
             rerun_config.setdefault("rerun_open", global_config.rerun_open)
             rerun_config.setdefault("rerun_web", global_config.rerun_web)
-            return autoconnect(
+            bundle = autoconnect(
                 RerunBridgeModule.blueprint(
                     **rerun_config,
                 ),
@@ -69,7 +69,30 @@ def vis_module(
                 WebsocketVisModule.blueprint(),
             )
         case "none":
-            return autoconnect(WebsocketVisModule.blueprint())
+            bundle = autoconnect(WebsocketVisModule.blueprint())
         case _:
             valid = ", ".join(get_args(ViewerBackend))
             raise ValueError(f"Unknown viewer_backend {viewer_backend!r}. Expected one of: {valid}")
+    return _with_relay_bridge(bundle)
+
+
+def _with_relay_bridge(bundle: Blueprint) -> Blueprint:
+    """Append the cockpit RelayBridgeModule when the relay is enabled.
+
+    Every robot blueprint funnels through vis_module, so this one hook
+    activates `dimos run <blueprint> --local-relay` (and --relay-url) for all
+    of them. Runs at blueprint-import time, after the CLI applied its
+    overrides to global_config (the rerun_web flag above relies on the same
+    ordering).
+    """
+    from dimos.core.global_config import global_config
+
+    if not (global_config.local_relay or global_config.relay_url):
+        return bundle
+    try:
+        from dimos.web.relay_bridge.relay_bridge_module import RelayBridgeModule
+    except ImportError as e:
+        raise RuntimeError(
+            "--local-relay/--relay-url need the web extra: pip install 'dimos[web]'"
+        ) from e
+    return autoconnect(bundle, RelayBridgeModule.blueprint())

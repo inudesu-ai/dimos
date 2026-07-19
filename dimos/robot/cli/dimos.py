@@ -310,6 +310,14 @@ def run(
     config_path: Path = typer.Option(
         CONFIG_DIR / "dimos", "--config", "-c", help="Path to config file"
     ),
+    local_relay: bool | None = typer.Option(
+        None,
+        "--local-relay/--no-local-relay",
+        help="Spawn a local cockpit relay and bridge this robot to it",
+    ),
+    relay_url: str | None = typer.Option(
+        None, "--relay-url", help="Bridge this robot to a running relay (wtUrl)"
+    ),
     show_help: bool = typer.Option(False, "--help"),
 ) -> None:
     """Start a robot blueprint"""
@@ -332,6 +340,18 @@ def run(
     setup_exception_handler()
 
     cli_config_overrides: dict[str, Any] = ctx.obj
+    # The relay flags are accepted on `run` itself because the root
+    # GlobalConfig auto-flags only parse before the subcommand token. They
+    # must reach global_config before the blueprint import below: vis_module
+    # reads them at blueprint-import time.
+    run_overrides = {
+        name: value
+        for name, value in (("local_relay", local_relay), ("relay_url", relay_url))
+        if value is not None
+    }
+    if run_overrides:
+        cli_config_overrides.update(run_overrides)
+        global_config.update(**run_overrides)
 
     # Clean stale registry entries
     stale = cleanup_stale()
