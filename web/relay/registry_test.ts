@@ -159,20 +159,27 @@ Deno.test("takeover closes the old session, keeps n, reattaches watchers", () =>
   const reg = new Registry();
   const first = new FakeRobot("r1", SPECS);
   reg.registerRobot(first);
-  attach(reg, "r1", ["odom"]);
+  const watcher = attach(reg, "r1", ["odom"]);
   const nBefore = first.lastSubs().n;
 
   const second = new FakeRobot("r1", SPECS);
   reg.registerRobot(second);
   assertEquals(first.closed, "replaced by new robot");
+  // Viewers hear about the takeover: this push is what makes debug.html
+  // re-watch and refresh a manifest that changed across the restart.
+  assertEquals(watcher.pushed, [{ t: "robots", robots: [second.info!] }]);
   // Forced snapshot to the new session carries the surviving watcher's subs
   // and continues the old counter (the bridge's stale-n filter keeps working
   // even though it is a fresh client session).
   assertEquals(second.lastSubs().chs, ["odom"]);
   assert(second.lastSubs().n > nBefore, "n must continue past the old session's");
 
-  // The old session's close callback must not unregister the new one.
+  // The old session's close callback must not unregister the new one, and a
+  // delayed hello resend from the replaced session must not re-register it
+  // (that would kick the live session).
   reg.robotClosed(first);
+  reg.registerRobot(first);
+  assertEquals(second.closed, null);
   const viewer2 = attach(reg, "r1", ["color_image"]);
   assertEquals(second.lastSubs().chs, ["color_image", "odom"]);
   assertEquals(viewer2.replies.filter((m) => m.t === "error"), []);
@@ -233,11 +240,64 @@ Deno.test("manifest delivery wins over the frame header's", () => {
   const reg = new Registry();
   const robot = new FakeRobot("r1", SPECS); // odom declared reliable
   reg.registerRobot(robot);
-  const viewer = attach(reg, "r1", ["odom", "mystery"]);
+  const viewer = attach(reg, "r1", ["odom"]);
   reg.onRobotFrame(robot, frame("odom", 1, "latest")); // header says latest
   assert(viewer.policies.get("odom") instanceof ReliableChannel);
-  // Undeclared channel: the header's delivery is the fallback.
-  reg.onRobotFrame(robot, frame("mystery", 1, "latest"));
+});
+
+Deno.test("sub to an undeclared channel is rejected", () => {
+  const reg = new Registry();
+  const robot = new FakeRobot("r1", SPECS);
+  reg.registerRobot(robot);
+  const viewer = attach(reg, "r1", []);
+  const before = robot.subs().length;
+  send(reg, viewer, { t: "sub", ch: "mystery" });
+  assertEquals((viewer.replies.at(-1) as { code: string }).code, "unknown_channel");
+  assertEquals(viewer.subs.size, 0);
+  assertEquals(robot.subs().length, before); // no new snapshot went out
+});
+
+Deno.test("a robot that declared no manifest accepts any sub", () => {
+  // The transport e2e tests hello without a manifest and steer delivery via
+  // frame headers; with nothing to validate against, subs pass through.
+  const reg = new Registry();
+  const robot = new FakeRobot("r1", []);
+  reg.registerRobot(robot);
+  const viewer = attach(reg, "r1", ["anything"]);
+  assertEquals(robot.lastSubs().chs, ["anything"]);
+  assertEquals(viewer.replies.filter((m) => m.t === "error"), []);
+});
+
+Deno.test("sub while the watched robot is offline is rejected", () => {
+  const reg = new Registry();
+  const robot = new FakeRobot("r1", SPECS);
+  reg.registerRobot(robot);
+  const viewer = attach(reg, "r1", []);
+  reg.robotClosed(robot);
+  send(reg, viewer, { t: "sub", ch: "odom" });
+  assertEquals((viewer.replies.at(-1) as { code: string }).code, "unknown_robot");
+  assertEquals(viewer.subs.size, 0);
+});
+
+Deno.test("takeover-stale sub is filtered from snapshots, frames fall back to header delivery", () => {
+  const reg = new Registry();
+  const withMystery: ChannelSpec[] = [
+    ...SPECS,
+    { ch: "mystery", encoding: "x", delivery: "latest", maxHz: 1 },
+  ];
+  const first = new FakeRobot("r1", withMystery);
+  reg.registerRobot(first);
+  const viewer = attach(reg, "r1", ["mystery"]);
+  assertEquals(first.lastSubs().chs, ["mystery"]);
+
+  const second = new FakeRobot("r1", SPECS); // manifest shrank across restart
+  reg.registerRobot(second);
+  // The surviving sub is no longer in the manifest: snapshots must not carry
+  // it (an out-of-manifest union could outgrow the datagram budget) ...
+  assertEquals(second.lastSubs().chs, []);
+  // ... but if the robot still sends the channel, routing falls back to the
+  // frame header's delivery.
+  reg.onRobotFrame(second, frame("mystery", 1, "latest"));
   assert(viewer.policies.get("mystery") instanceof LatestChannel);
 });
 

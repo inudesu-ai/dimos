@@ -220,13 +220,16 @@ const MSG_VALIDATORS: Record<string, (value: Record<string, unknown>) => boolean
 /** Validated message from parsed JSON; null for unknown or malformed ones. */
 export function msgFromUnknown(value: unknown): Msg | null {
   if (!isRecord(value) || typeof value.t !== "string") return null;
-  const fields = MSG_FIELDS[value.t];
+  // Object.hasOwn: a bare [value.t] lookup traverses to Object.prototype, so
+  // {"t":"toString"} would come back typed as Msg while the mirrored
+  // protocol.py (dict membership) rejects it.
+  const fields = Object.hasOwn(MSG_FIELDS, value.t) ? MSG_FIELDS[value.t] : undefined;
   if (fields === undefined) return null;
   for (const [name, kind] of Object.entries(fields)) {
     const actual = typeof value[name];
     if (actual !== kind) return null;
   }
-  const structural = MSG_VALIDATORS[value.t];
+  const structural = Object.hasOwn(MSG_VALIDATORS, value.t) ? MSG_VALIDATORS[value.t] : undefined;
   if (structural !== undefined && !structural(value)) return null;
   return value as unknown as Msg;
 }

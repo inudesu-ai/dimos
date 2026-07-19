@@ -42,6 +42,9 @@ function closeAfterFlush(wt: WebTransport, reason: string): void {
 export class RobotSession implements RobotPeer {
   info: RobotInfo | null = null;
   channels: ChannelSpec[] = [];
+  /** Close reason; set before the transport close so a hello resend still
+   * queued on this session cannot re-register it after a takeover. */
+  closed: string | null = null;
   readonly #wt: WebTransport;
   readonly #conn: Deno.QuicConn;
   readonly #registry: Registry;
@@ -59,6 +62,7 @@ export class RobotSession implements RobotPeer {
   }
 
   close(reason: string): void {
+    this.closed = reason;
     try {
       this.#wt.close({ closeCode: 0, reason });
     } catch {

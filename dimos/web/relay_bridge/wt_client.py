@@ -48,10 +48,12 @@ logger = setup_logger()
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
-# QUIC datagrams above the path MTU are dropped, not fragmented; typical
-# budget after QUIC overhead is ~1200 B. Warn while a robot hello (identity +
-# manifest) still fits comfortably rather than fail mysteriously later.
-_HELLO_DATAGRAM_WARN_BYTES = 1100
+# aioquic never drops an unsendable datagram: max_datagram_size is fixed at
+# 1200 B (no PMTUD) and _write_application retries _datagrams_pending[0]
+# forever, so a datagram that cannot fit one packet (~1165 B encoded) wedges
+# every datagram queued behind it - hello resends, pings, all send_control.
+# Refuse to queue one; 1100 keeps margin under the real cliff.
+_HELLO_DATAGRAM_MAX_BYTES = 1100
 
 
 class RelayClient:
@@ -69,6 +71,7 @@ class RelayClient:
         self._ping_n = itertools.count(1)
         self._seq: dict[str, itertools.count[int]] = {}
         self._writers: list[LatestChannelWriter] = []
+        self._close_started = False
 
     @classmethod
     async def connect(
@@ -125,6 +128,12 @@ class RelayClient:
         await self.close()
 
     async def close(self) -> None:
+        # Guarded before the first await: a concurrent second close (watchdog
+        # and supervisor overlap) would re-enter the connect context manager
+        # mid-__aexit__ and raise "asynchronous generator is already running".
+        if self._close_started:
+            return
+        self._close_started = True
         for writer in self._writers:
             writer.stop()
         self._writers.clear()
@@ -141,16 +150,17 @@ class RelayClient:
 
         Robot sessions carry their identity and channel manifest in the hello
         (the relay registers the robot from it). Datagrams are lossy, so the
-        hello is repeated every 200 ms. Raises ProtocolError if the relay
-        answers with an error (version mismatch, missing robot id),
-        TimeoutError if nothing answers within `timeout`.
+        hello is repeated every 200 ms. Raises ProtocolError if the encoded
+        hello exceeds the datagram budget or the relay answers with an error
+        (version mismatch, missing robot id), TimeoutError if nothing answers
+        within `timeout`.
         """
         msg = Hello(v=PROTOCOL_VERSION, role=self.role, robot=robot, manifest=manifest)
         size = len(encode_datagram(msg))
-        if size > _HELLO_DATAGRAM_WARN_BYTES:
-            logger.warning(
-                f"hello datagram is {size} B; QUIC datagrams above the ~1200 B path MTU "
-                "are dropped - trim the manifest"
+        if size > _HELLO_DATAGRAM_MAX_BYTES:
+            raise ProtocolError(
+                f"hello datagram is {size} B (limit {_HELLO_DATAGRAM_MAX_BYTES}); an "
+                "oversized datagram wedges aioquic's whole datagram queue - trim the manifest"
             )
         deadline = time.monotonic() + timeout
         while True:

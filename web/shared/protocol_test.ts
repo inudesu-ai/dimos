@@ -134,6 +134,11 @@ Deno.test("msgFromUnknown validates shape and rejects unknown/malformed", () => 
   assertEquals(msgFromUnknown({ t: "hello", v: 1 }), null); // missing role
   assertEquals(msgFromUnknown(null), null);
   assertEquals(msgFromUnknown([1, 2]), null);
+  // Prototype-chain keys must not resolve through Object.prototype (the
+  // mirrored protocol.py rejects these; test_protocol.py asserts the same).
+  assertEquals(msgFromUnknown({ t: "toString" }), null);
+  assertEquals(msgFromUnknown({ t: "constructor" }), null);
+  assertEquals(msgFromUnknown({ t: "hasOwnProperty" }), null);
 });
 
 Deno.test("msgFromUnknown validates nested session-message shapes", () => {

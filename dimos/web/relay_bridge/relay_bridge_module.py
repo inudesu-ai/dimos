@@ -160,7 +160,7 @@ class RelayBridgeModule(Module):
         self._supervisor: asyncio.Task[None] | None = None
         self._watchdog: asyncio.Task[None] | None = None
         self._stopping = False
-        self._last_n = 0
+        self._last_n: int | float = 0
         # ch -> sender(payload, meta); rebuilt for every relay session.
         self._senders: dict[str, Callable[[bytes, dict[str, Any] | None], None]] = {}
         # ch -> unsubscribe; present only while >= 1 viewer wants the channel.
@@ -177,25 +177,47 @@ class RelayBridgeModule(Module):
             self._url = await asyncio.to_thread(self._spawn_relay, self.config.open_browser)
         # The first connect fails fast: a relay that cannot be reached at
         # startup should fail the module start visibly, not retry forever.
-        self._client = await self._connect_and_hello()
+        try:
+            self._client = await self._connect_and_hello()
+        except BaseException:
+            # A start that dies pre-yield never reaches the teardown below;
+            # reap the child we just spawned (BaseException: cancellation too).
+            if self._relay is not None:
+                await asyncio.to_thread(self._relay.stop)
+            raise
         self._supervisor = asyncio.ensure_future(self._supervise())
         if self._relay is not None:
             self._watchdog = asyncio.ensure_future(self._watch_child())
         logger.info(f"relay bridge up: robot={self._robot_info.id} relay={self._url}")
         yield
         self._stopping = True
-        for task in (self._supervisor, self._watchdog):
-            if task is not None:
+        try:
+            for task in (self._supervisor, self._watchdog):
+                if task is None:
+                    continue
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
+                try:
                     await task
-        self._reconcile(set())
-        if self._client is not None:
-            await self._client.close()
-        if self._relay is not None:
-            await asyncio.to_thread(self._relay.stop)
-
-    # ---- relay process + session management (module event loop) ----
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    # A task that already died with its own exception re-raises
+                    # it here; teardown must keep going regardless.
+                    logger.exception("relay bridge task failed during teardown")
+            try:
+                self._reconcile(set())
+            except Exception:
+                logger.exception("relay bridge: unsubscribing inputs during stop failed")
+            if self._client is not None:
+                try:
+                    await self._client.close()
+                except Exception:
+                    logger.exception("relay bridge: closing the relay session failed")
+        finally:
+            # Always reached: an orphaned Deno child would outlive this process
+            # holding its port (it has no PDEATHSIG).
+            if self._relay is not None:
+                await asyncio.to_thread(self._relay.stop)
 
     def _spawn_relay(self, open_browser: bool) -> str:
         """Start a fresh local relay child (blocking; run via to_thread)."""
@@ -239,14 +261,33 @@ class RelayBridgeModule(Module):
         client = self._client
         assert client is not None
         while True:
-            async for msg in client.control_messages():
-                if isinstance(msg, Subs) and msg.n > self._last_n:
-                    self._last_n = msg.n
-                    self._reconcile(set(msg.chs))
-            # The iterator only ends when the session closed.
-            self._reconcile(set())
+            crashed = False
+            try:
+                async for msg in client.control_messages():
+                    if isinstance(msg, Subs) and msg.n > self._last_n:
+                        self._last_n = msg.n
+                        self._reconcile(set(msg.chs))
+                # The iterator only ends when the session closed.
+            except Exception:
+                # An unguarded error here would silently end supervision while
+                # the module stays "up" (never CancelledError: stop() cancels).
+                crashed = True
+                logger.exception("relay bridge supervisor error; recycling the relay session")
+            # Release the session before replacing it: only close() reaches
+            # aioquic's transport.close(), else the UDP socket leaks until
+            # cycle GC. Idempotent, so the watchdog/teardown may close too.
+            with contextlib.suppress(Exception):
+                await client.close()
+            try:
+                self._reconcile(set())
+            except Exception:
+                logger.exception("relay bridge: stopping encoders failed")
             if self._stopping:
                 return
+            if crashed:
+                # Reconnect only pauses on FAILED connects; without this a
+                # persistent reconcile error would recycle at handshake speed.
+                await asyncio.sleep(_RECONNECT_PAUSE_S)
             logger.warning("relay session lost; encoders stopped, reconnecting")
             reconnected = await self._reconnect()
             if reconnected is None:
@@ -262,7 +303,7 @@ class RelayBridgeModule(Module):
             relay, client = self._relay, self._client
             if (
                 relay is not None
-                and relay.poll() is not None
+                and not relay.is_running()
                 and client is not None
                 and not client.is_closed
             ):
@@ -271,13 +312,16 @@ class RelayBridgeModule(Module):
 
     async def _reconnect(self) -> RelayClient | None:
         while not self._stopping:
-            if self._relay is not None and self._relay.poll() is not None:
-                # The child died (crash or kill): its QUIC port and cert are
-                # gone with it, so respawn and re-read the ready line. The
-                # browser page reconnects itself via the stable HTTP port.
+            if self._relay is not None and not self._relay.is_running():
+                # The child is gone (crash, kill, or a previous respawn that
+                # failed): its QUIC port and cert die with it, so respawn and
+                # re-read the ready line. The browser page reconnects itself
+                # via the stable HTTP port. `not is_running()` rather than
+                # `poll() is not None`: a failed start leaves no process and
+                # poll() would read None forever, latching respawns off.
                 logger.warning("local relay child died; respawning")
-                await asyncio.to_thread(self._relay.stop)
                 try:
+                    await asyncio.to_thread(self._relay.stop)
                     self._url = await asyncio.to_thread(self._spawn_relay, False)
                 except Exception:
                     logger.exception("relay respawn failed; retrying")
@@ -290,14 +334,19 @@ class RelayBridgeModule(Module):
                 await asyncio.sleep(_RECONNECT_PAUSE_S)
         return None
 
-    # ---- lazy subscriptions (module event loop) ----
-
     def _reconcile(self, want: set[str]) -> None:
         """Subscribe/unsubscribe inputs so exactly `want` is being encoded."""
         for cd in CHANNELS:
             active = cd.ch in self._unsubs
             should = cd.ch in want
             if should and not active:
+                if self.inputs[cd.ch].transport is None:
+                    # Advertised but unwired (standalone wiring): In.subscribe
+                    # would raise. Skipping self-heals on the next snapshot.
+                    logger.warning(
+                        f"relay bridge: {cd.ch} input has no transport wired; cannot encode"
+                    )
+                    continue
                 self._unsubs[cd.ch] = self.inputs[cd.ch].subscribe(
                     functools.partial(self._on_input, cd)
                 )
@@ -308,8 +357,6 @@ class RelayBridgeModule(Module):
         unknown = want - {cd.ch for cd in CHANNELS}
         if unknown:
             logger.debug(f"relay bridge: ignoring unknown channels {sorted(unknown)}")
-
-    # ---- data path ----
 
     def _on_input(self, cd: ChannelDef, msg: Any) -> None:
         """Transport-thread callback: maxHz gate, encode, hand to the loop."""

@@ -44,8 +44,11 @@ def kill_stale_port_holder(port: int) -> None:
     relay if two run on one machine (accepted for local single-robot dev).
     """
     try:
+        # LISTEN-state only: a plain :port match also lists processes merely
+        # connected to the port (a browser tab on the debug page) and would
+        # SIGTERM them along with the stale relay.
         result = subprocess.run(
-            ["lsof", "-ti", f":{port}"],
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -126,6 +129,15 @@ class RelayProcess:
     def poll(self) -> int | None:
         """Child exit code; None while running (or after stop()/before start())."""
         return None if self._process is None else self._process.poll()
+
+    def is_running(self) -> bool:
+        """True while a started child is alive.
+
+        False before start(), after stop(), and after a FAILED start() - which
+        is why respawn gates must use this rather than `poll() is not None`:
+        a failed start leaves no process, and poll() reads None forever.
+        """
+        return self._process is not None and self._process.poll() is None
 
     def stop(self) -> None:
         if self._process is None:

@@ -23,9 +23,13 @@ import asyncio
 import pytest
 
 from dimos.web.relay_bridge.protocol import (
+    ChannelSpec,
     DataFrame,
     FrameHeader,
     Msg,
+    ProtocolError,
+    RobotInfo,
+    RobotManifest,
     Subs,
     encode_data_frame,
 )
@@ -175,3 +179,39 @@ async def test_control_messages_wakes_on_late_push() -> None:
     seen = [msg async for msg in client.control_messages()]
     await pusher
     assert seen == [Subs(chs=["odom"], n=7)]
+
+
+async def test_hello_oversized_datagram_refused() -> None:
+    # An unsendable datagram wedges aioquic's whole datagram queue, so an
+    # oversized hello must be refused before anything is queued. StubSession
+    # has no send_msg/welcomed: a guard placed after the first send would fail
+    # this test with AttributeError instead.
+    client = _client(StubSession())
+    manifest = RobotManifest(
+        channels=[
+            ChannelSpec(ch=f"channel_{i}", encoding="jpeg.v1", delivery="latest", maxHz=15.0)
+            for i in range(40)
+        ]
+    )
+    with pytest.raises(ProtocolError, match="hello datagram"):
+        await client.hello(robot=RobotInfo(id="r1", name="r1", model="test"), manifest=manifest)
+
+
+class FakeCtx:
+    def __init__(self) -> None:
+        self.exits = 0
+
+    async def __aexit__(self, *exc: object) -> None:
+        self.exits += 1
+        await asyncio.sleep(0.01)
+
+
+async def test_close_is_idempotent_and_concurrent_safe() -> None:
+    # Supervisor, watchdog, and teardown can all close the same client; a
+    # second __aexit__ entering the connect context manager while the first
+    # is still awaiting inside it would raise. Only the first may run.
+    ctx = FakeCtx()
+    client = RelayClient("https://127.0.0.1:1", "robot", StubSession(), ctx=ctx)
+    await asyncio.gather(client.close(), client.close())
+    await client.close()
+    assert ctx.exits == 1

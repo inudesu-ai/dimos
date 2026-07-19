@@ -109,11 +109,9 @@ class ViewerStats:
 
 
 async def _attach_viewer(viewer: RelayClient) -> None:
-    """watch the demo robot, then subscribe to both channels.
-
-    watch rides a lossy datagram, so it is resent until the manifest reply
-    proves it landed; subs go out only after that.
-    """
+    """watch the demo robot; the watch rides a lossy datagram, so it is
+    resent until the manifest reply proves it landed. Subs are driven by
+    _wait_subscribed, which resends them until the robot leg confirms."""
     await viewer.hello()
     deadline = time.monotonic() + 10
     while True:
@@ -125,17 +123,34 @@ async def _attach_viewer(viewer: RelayClient) -> None:
             break
         if time.monotonic() > deadline:
             raise TimeoutError("viewer could not watch the demo robot")
-    for spec in MANIFEST.channels:
-        viewer.send_control(Sub(ch=spec.ch))
 
 
-async def _wait_subscribed(robot: RelayClient) -> None:
-    """Robot-side barrier: block until the relay reports both channels wanted."""
+async def _wait_subscribed(robot: RelayClient, viewer: RelayClient, timeout: float = 10.0) -> None:
+    """Resend subs until the relay reports both channels wanted.
+
+    Subs ride lossy datagrams too, and the relay's subs snapshot to the robot
+    is the only proof of delivery: a one-shot Sub lost on a remote path would
+    never be healed. Polls the raw control queue - wait_for around the
+    control_messages() generator would close it permanently on timeout.
+    """
     wanted = {spec.ch for spec in MANIFEST.channels}
-    async for msg in robot.control_messages():
-        if isinstance(msg, Subs) and wanted <= set(msg.chs):
-            return
-    raise RuntimeError("relay session closed before viewers subscribed")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for spec in MANIFEST.channels:
+            viewer.send_control(Sub(ch=spec.ch))
+        window = min(time.monotonic() + 0.5, deadline)
+        while time.monotonic() < window:
+            if robot.is_closed:
+                raise RuntimeError("relay session closed before viewers subscribed")
+            with contextlib.suppress(asyncio.TimeoutError):
+                msg = await asyncio.wait_for(
+                    robot._session.control_msgs.get(), window - time.monotonic()
+                )
+                if isinstance(msg, Subs) and wanted <= set(msg.chs):
+                    return
+    raise TimeoutError(
+        f"relay never reported viewers subscribed to {sorted(wanted)} within {timeout} s"
+    )
 
 
 async def run(url: str, secs: float) -> None:
@@ -146,7 +161,7 @@ async def run(url: str, secs: float) -> None:
     ):
         await robot.hello(robot=ROBOT, manifest=MANIFEST)
         await _attach_viewer(viewer)
-        await asyncio.wait_for(_wait_subscribed(robot), timeout=10)
+        await _wait_subscribed(robot, viewer)
         rtt = await viewer.ping()
         print(f"connected; datagram RTT {rtt * 1000:.1f} ms")
 

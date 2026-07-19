@@ -195,6 +195,15 @@ def test_msg_from_dict_validates_types():
         msg_from_dict({"t": "bogus"})  # unknown type
     with pytest.raises(ProtocolError):
         msg_from_dict({"t": "ping", "n": True, "ts": 2.5})  # bool is not a number
+    # Mirrored-validator parity: protocol.ts must also reject prototype-chain
+    # keys instead of resolving them through Object.prototype (protocol_test.ts
+    # asserts the same three).
+    with pytest.raises(ProtocolError):
+        msg_from_dict({"t": "toString"})
+    with pytest.raises(ProtocolError):
+        msg_from_dict({"t": "constructor"})
+    with pytest.raises(ProtocolError):
+        msg_from_dict({"t": "hasOwnProperty"})
 
 
 def test_msg_from_dict_validates_nested_session_shapes():

@@ -268,7 +268,12 @@ def _get_default_value(defaults: object, key: str, fallback: Any) -> Any:
     return fallback
 
 
-def load_config_args(config: type[BaseModel], args: Iterable[str], path: Path) -> dict[str, Any]:
+def load_config_args(
+    config: type[BaseModel],
+    args: Iterable[str],
+    path: Path,
+    cli_g_overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
         kwargs = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
@@ -292,6 +297,11 @@ def load_config_args(config: type[BaseModel], args: Iterable[str], path: Path) -
         for p in parts[:-1]:
             d = d.setdefault(p, {})
         d[parts[-1]] = v
+
+    if cli_g_overrides:
+        # Explicit CLI flags (--transport, --local-relay, ...) win for their
+        # own keys but must not wipe the rest of the g subtree built above.
+        kwargs.setdefault("g", {}).update(cli_g_overrides)
 
     # We don't need this config, but this atleast validates the user input first.
     # This will help catch misspellings and similar mistakes.
@@ -386,9 +396,7 @@ def run(
         return
 
     blueprint_config = blueprint.config()
-    kwargs = load_config_args(blueprint_config, blueprint_args, config_path)
-    if cli_config_overrides:
-        kwargs["g"] = cli_config_overrides
+    kwargs = load_config_args(blueprint_config, blueprint_args, config_path, cli_config_overrides)
 
     coordinator = ModuleCoordinator.build(blueprint, kwargs)
 
