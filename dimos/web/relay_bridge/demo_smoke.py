@@ -135,7 +135,7 @@ async def run(url: str, secs: float) -> None:
                     f"resets {image_writer.resets}) odom {odom_sent} | rx {stats.line()}"
                 )
 
-        viewer_task = asyncio.ensure_future(viewer_pump())
+        viewer_task = asyncio.create_task(viewer_pump())
         try:
             await asyncio.gather(image_pump(), odom_pump(), report())
         finally:
