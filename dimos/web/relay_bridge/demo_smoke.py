@@ -31,6 +31,7 @@ import json
 import math
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -164,7 +165,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.url is not None:
-        asyncio.run(run(args.url, args.secs))
+        # /api/info's wtUrl ends in /viewer; strip the path so each role picks its own.
+        parsed = urlparse(args.url)
+        url = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else args.url
+        asyncio.run(run(url, args.secs))
         return
     with RelayProcess() as info:
         print(f"relay up; open {info.debug_url} in Chrome/Firefox to watch")

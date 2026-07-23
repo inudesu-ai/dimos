@@ -312,22 +312,21 @@ async def test_latest_writer_resets_stale_stream(relay: RelayReadyInfo) -> None:
 async def test_close_signal_stops_writer_and_wakes_waiter() -> None:
     """Relay death terminates the connection, wakes wait_closed, stops the pump."""
     process = RelayProcess()
-    info = process.start()
-    robot = await RelayClient.connect(info.wt_url, "robot")
     try:
-        await robot.hello()
-        writer = robot.latest_writer("cam")
-        writer.offer(b"x" * 1000)
-        await asyncio.sleep(0.1)  # let the pump start
-        process.stop()  # graceful shutdown sends CONNECTION_CLOSE
+        info = process.start()
+        async with await RelayClient.connect(info.wt_url, "robot") as robot:
+            await robot.hello()
+            writer = robot.latest_writer("cam")
+            writer.offer(b"x" * 1000)
+            await asyncio.sleep(0.1)  # let the pump start
+            process.stop()  # graceful shutdown sends CONNECTION_CLOSE
 
-        await asyncio.wait_for(robot.wait_closed(), timeout=10.0)
-        assert robot.is_closed
-        await asyncio.sleep(0.1)  # let the pump observe the close
-        assert writer._task.done()
-        # A dead channel is visible at the producer.
-        with pytest.raises(RuntimeError):
-            writer.offer(b"y")
+            await asyncio.wait_for(robot.wait_closed(), timeout=10.0)
+            assert robot.is_closed
+            await asyncio.sleep(0.1)  # let the pump observe the close
+            assert writer._task.done()
+            # A dead channel is visible at the producer.
+            with pytest.raises(RuntimeError):
+                writer.offer(b"y")
     finally:
-        await robot.close()
         process.stop()
