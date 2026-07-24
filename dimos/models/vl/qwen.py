@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 from openai import OpenAI
+from pydantic import Field
 
 from dimos.models.vl.base import VlModel, VlModelConfig
 from dimos.msgs.sensor_msgs.Image import Image
@@ -26,8 +27,17 @@ from dimos.msgs.sensor_msgs.Image import Image
 class QwenVlModelConfig(VlModelConfig):
     """Configuration for Qwen VL model."""
 
-    model_name: str = "qwen2.5-vl-72b-instruct"
-    api_key: str | None = None
+    model_name: str = Field(
+        default_factory=lambda: os.getenv("QWEN_VL_MODEL_NAME", "qwen2.5-vl-72b-instruct")
+    )
+    api_key: str | None = Field(
+        default_factory=lambda: os.getenv("QWEN_VL_API_KEY") or os.getenv("ALIBABA_API_KEY")
+    )
+    base_url: str = Field(
+        default_factory=lambda: os.getenv(
+            "QWEN_VL_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        )
+    )
 
 
 class QwenVlModel(VlModel):
@@ -35,14 +45,15 @@ class QwenVlModel(VlModel):
 
     @cached_property
     def _client(self) -> OpenAI:
-        api_key = self.config.api_key or os.getenv("ALIBABA_API_KEY")
+        api_key = self.config.api_key
         if not api_key:
             raise ValueError(
-                "Alibaba API key must be provided or set in ALIBABA_API_KEY environment variable"
+                "Qwen VL API key must be provided via config.api_key, QWEN_VL_API_KEY, "
+                "or ALIBABA_API_KEY"
             )
 
         return OpenAI(
-            base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            base_url=self.config.base_url,
             api_key=api_key,
         )
 
