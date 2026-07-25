@@ -1,7 +1,0 @@
-{
-  "name": "@dimos/shared",
-  "version": "0.0.0",
-  "exports": {
-    ".": "./protocol.ts"
-  }
-}
